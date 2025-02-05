@@ -1,0 +1,7 @@
+# Exclude data folder
+data/
+
+# Exclude Python cache files
+__pycache__/
+*.pyc
+config.ini
