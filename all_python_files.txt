@@ -1,0 +1,1221 @@
+===== File: config\HorseRaceParams.py =====
+# FastRaceML/HorseRaceParams.py
+
+import os
+from data_prep.utilities import setup_logging
+
+# Example param definitions
+current_dir = os.getcwd()
+data_dir = os.path.join(current_dir, "Data")
+log_dir = os.path.join(current_dir, "Log")
+output_dir = os.path.join(data_dir, "predictions")
+temp_dir = os.path.join(current_dir, "Temp")
+
+# Possibly call setup_logging, or let pipeline handle that
+# setup_logging(os.path.join(log_dir, "FastRaceML.log"))
+
+# Additional constants or paths
+max_npp = 10
+max_nwrk = 12
+
+
+
+===== File: config\__init__.py =====
+
+
+===== File: data_prep\ingestion.py =====
+import logging
+from pathlib import Path
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+def scan_cards(root_dir, track_pattern="*.DRF"):
+    """
+    Scans the specified directory (non-recursively) for files matching the track_pattern
+    and returns a list of dictionaries representing each found file.
+
+    Each dictionary contains:
+        {
+            "card": <filename without extension>,
+            "filename": <Path object of the file>
+        }
+
+    Args:
+        root_dir (str or Path): The directory to scan.
+        track_pattern (str): The file pattern to match (default: "*.DRF").
+
+    Returns:
+        list[dict]: A list of dictionaries for each file matching the pattern.
+
+    Raises:
+        FileNotFoundError: If the specified directory does not exist.
+    """
+    # Convert the input to a Path object and remove any extraneous whitespace.
+    root_path = Path(str(root_dir).strip())
+    if not root_path.exists():
+        raise FileNotFoundError(f"Directory '{root_path}' does not exist.")
+
+    # Use glob (non-recursive) to find files in the top-level folder.
+    files = list(root_path.glob(track_pattern))
+    logger.info(f"Found {len(files)} file(s) matching '{track_pattern}' in '{root_path}'.")
+
+    # Build and return the list of dictionaries.
+    card_list = [{"card": file.stem, "filename": file} for file in files]
+    return card_list
+
+def load_results_and_merge(pp_all_df, results_dir, result_field_mapping_csv, track_pattern="",
+                           result_merge_cols=None):
+    """
+    Loads result CSV files using a field mapping CSV, constructs a results DataFrame,
+    and merges it with the Past Performance (PP) DataFrame on a constructed merge key.
+    A new column order is then applied and the merged DataFrame is saved to CSV.
+    
+    You can optionally supply a dictionary (result_merge_cols) that specifies the 
+    result columns to use for the merge key. For example:
+    
+        {
+            "track": "res_track_name",       # if your CSV mapping uses 'res_track_name'
+            "date": "res_race_date",           # if your CSV mapping uses 'res_race_date'
+            "race_no": "res_race_number",      # if your CSV mapping uses 'res_race_number'
+            "name": "res_horse_name"                 # cleaned horse name column
+        }
+    
+    If result_merge_cols is not provided, the following defaults are used:
+    
+        {
+            "track": "res_track_name",
+            "date": "res_race_date",
+            "race_no": "res_race_number",
+            "name": "res_horse_name"
+        }
+    
+    Args:
+        pp_all_df (pd.DataFrame): DataFrame containing PP data.
+        results_dir (str or Path): Directory containing result CSV files.
+        result_field_mapping_csv (str or Path): CSV mapping for result fields.
+        track_pattern (str): Optional filename prefix (e.g., "SA") for results.
+        result_merge_cols (dict): Optional dictionary specifying which result columns
+                                  to use for merging.
+        
+    Returns:
+        tuple: (merged_df, field_map) where:
+            - merged_df is the merged DataFrame (with new column order),
+            - field_map is the list of dictionaries from the result mapping.
+    """
+    # Set default merge columns if not provided.
+    if result_merge_cols is None:
+        result_merge_cols = {
+            "track": "res_track_name",
+            "date": "res_race_date",
+            "race_no": "res_race_number",
+            "horse_name": "res_horse_name"
+        }
+    
+    # Read the result field mapping CSV.
+    # Skip the first row (which is extra) and specify column names.
+    mapping_df = pd.read_csv(result_field_mapping_csv,
+                             skiprows=1,
+                             header=None,
+                             names=["field_position", "field_name", "predictive_feature"])
+    # Ensure that "field_position" is an integer.
+    mapping_df["field_position"] = mapping_df["field_position"].astype(int)
+    
+    # Sort by field_position to ensure proper ordering.
+    field_map = mapping_df.sort_values(by="field_position").to_dict(orient="records")
+    
+    # Ensure the results directory exists.
+    results_path = Path(results_dir)
+    if not results_path.exists():
+        raise FileNotFoundError(f"Results directory '{results_path}' does not exist.")
+    
+    all_results = []
+    logger.info(f"Loading result files from '{results_path}' using pattern '{track_pattern}'")
+    
+    # Parse each result file (non-recursively) using the field mapping.
+    for csv_file in results_path.glob(track_pattern):
+        if csv_file.is_file():
+            logger.debug(f"Parsing result file: {csv_file}")
+            with open(csv_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    items = line.split(",")
+                    record = {}
+                    for fm in field_map:
+                        pos = int(fm["field_position"])
+                        col_name = fm["field_name"]
+                        record[col_name] = items[pos].strip('"') if pos < len(items) else ""
+                    all_results.append(record)
+        else:
+            logger.debug(f"Skipping non-file: {csv_file}")
+    
+    # Convert result records into a DataFrame.
+    # (Do not prepend "res_" since the mapping already contains the correct names.)
+    res_columns = [fm["field_name"] for fm in field_map]
+    result_df = pd.DataFrame(all_results, columns=res_columns)
+    
+       # Save the engineered DataFrame to CSV.
+    result_df.to_csv("data\\outputs\\results.csv", index=False)
+    logger.info("Engineered features saved to 'engineered_features.csv'.")
+
+    # Construct merge keys.
+    # For PP data: expected columns are 'track', 'date', 'race_no', 'horse_name'
+    if {"track", "date", "race_no", "horse_name"}.issubset(pp_all_df.columns):
+        pp_all_df["race_key"] = (
+            pp_all_df["track"].astype(str).str.upper().str.strip() + "_" +
+            pp_all_df["date"].astype(str).str.strip() + "_" +
+            pp_all_df["race_no"].astype(str).str.strip() + "_" +
+            pp_all_df["horse_name"].astype(str).str.upper().str.strip()
+        )
+    else:
+        logger.warning("PP DataFrame missing one or more of: 'track', 'date', 'race_no', 'horse_name'")
+    
+    # For result data: use the columns specified in result_merge_cols.
+    missing_merge_cols = [col for col in result_merge_cols.values() if col not in result_df.columns]
+    if missing_merge_cols:
+        logger.error(f"Result DataFrame is missing merge columns: {missing_merge_cols}")
+    else:
+        result_df["race_key"] = (
+            result_df[result_merge_cols["track"]].astype(str).str.upper().str.strip() + "_" +
+            result_df[result_merge_cols["date"]].astype(str).str.strip() + "_" +
+            result_df[result_merge_cols["race_no"]].astype(str).str.strip() + "_" +
+            result_df[result_merge_cols["horse_name"]].astype(str).str.upper().str.strip()
+        )
+
+
+    # Merge PP and result DataFrames on 'race_key'.
+    logger.info("Merging PP data with result data...")
+    if "race_key" in pp_all_df.columns and "race_key" in result_df.columns:
+        merged_df = pd.merge(pp_all_df, result_df, how='left', on='race_key')
+        merged_df.drop_duplicates(subset=["race_key"], keep="first", inplace=True)
+    else:
+        logger.warning("Missing 'race_key' in one or both DataFrames; merge cannot be performed properly.")
+        merged_df = pp_all_df.copy()
+        
+    # Reorder columns based on the merged DataFrame's actual columns.
+    # - First, 'race_key'
+    # - Then, all columns that do NOT start with "res_" (assumed PP columns)
+    # - Finally, all columns that DO start with "res_" (assumed result columns)
+    all_cols = list(merged_df.columns)
+    pp_cols_order = [col for col in all_cols if not col.startswith("res_") and col != "race_key"]
+    res_cols_order = [col for col in all_cols if col.startswith("res_") and col != "race_key"]
+    new_column_order = ["race_key"] + pp_cols_order + res_cols_order
+    merged_df = merged_df[new_column_order]
+    #logger.error(f"New merged columns: {merged_df.columns.tolist()}")
+    
+    # Save merged data to CSV.
+    merged_df.to_csv("data\\outputs\\merged_data.csv", index=False)
+    logger.info("Merged data saved to 'merged_data.csv'.")
+    
+    return merged_df, field_map
+
+
+
+===== File: data_prep\preprocess.py =====
+# FastRaceML/data_prep/preprocess.py
+
+"""
+Preprocessing utilities for splitting data, handling missing values, 
+and preparing for model training.
+"""
+
+import logging
+import pandas as pd
+from sklearn.model_selection import train_test_split
+
+logger = logging.getLogger(__name__)
+
+def prepare_data_for_modeling(df, field_map, target_col="res_finish_position"):
+    """
+    - Select columns based on field_map['predictive_feature'] == 1
+    - Remove rows with NaN in those columns or the target
+    - One-hot encode
+    - Split into train, validation, and test sets
+    """
+    predictive_cols = [f["field_name"] for f in field_map if f["predictive_feature"] == 1]
+    
+    # Basic checks
+    if not predictive_cols:
+        raise ValueError("No predictive columns found in field_map.")
+
+    print (df.columns)
+    if target_col not in df.columns:
+        raise ValueError(f"Target column '{target_col}' not in DataFrame.")
+
+    X = df[predictive_cols].copy()
+    y = df[target_col].copy()
+
+    # Drop rows with NA
+    # valid_rows = X.notna().all(axis=1) & y.notna()
+    #X = X[valid_rows]
+    #y = y[valid_rows]
+
+    #if X.empty:
+    #    raise ValueError("No valid data after dropping missing values in features/target.")
+
+    # One-hot encode
+    X_encoded = pd.get_dummies(X, drop_first=True)
+
+    # Train/Val/Test split: 60%/20%/20% (or 70%/15%/15%)
+    X_train, X_temp, y_train, y_temp = train_test_split(X_encoded, y, test_size=0.3, random_state=42)
+    X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+
+    logger.info(f"Train shape: {X_train.shape}, Val shape: {X_val.shape}, Test shape: {X_test.shape}")
+
+    return X_train, X_val, X_test, y_train, y_val, y_test
+
+
+
+===== File: data_prep\readers.py =====
+# FastRaceML/data_prep/readers.py
+
+"""
+Contains functions to read past performance cards and results from files.
+"""
+
+import logging
+import pandas as pd
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+def load_single_card(pp_path, field_map):
+    """
+    Read a single Past Performance file and return a list of dicts.
+    Each dict maps field_map's 'field_name' to the corresponding value in each line.
+    """
+    all_pp_list = []
+    try:
+        with open(pp_path, "r") as f:
+            for counter, line in enumerate(f, start=1):
+                line_split = line.strip().split(',')
+                record = {}
+                # field_map is a list of dicts: [{"field_name": "...", "predictive_feature": 1}, ...]
+                for idx, fm in enumerate(field_map):
+                    field_name = fm["field_name"]
+                    record[field_name] = line_split[idx].strip('"') if idx < len(line_split) else ""
+                all_pp_list.append(record)
+    except FileNotFoundError:
+        logger.error(f"File not found: {pp_path}")
+    except Exception as e:
+        logger.error(f"Error reading {pp_path}: {e}")
+    return all_pp_list
+
+def load_all_pp_cards(pp_cards, field_mapping_csv):
+    """
+    Iterates over pp_cards = [
+       {"card": <file_stem>, "filename": Path(...)},
+       ...
+    ],
+    loads each into a list of dicts, concatenates into one DataFrame.
+    Returns:
+        pp_all_df (pd.DataFrame)
+        field_map (list[dict]) 
+    """
+    # Load field mappings (CSV must contain columns 'field_name' and 'predictive_feature')
+    mapping_df = pd.read_csv(field_mapping_csv)
+    field_map = mapping_df[['field_name', 'predictive_feature']].to_dict(orient='records')
+
+    all_pps = []
+    for card in pp_cards:
+        filename = card.get("filename")
+        if not filename:
+            logger.warning(f"Skipping card with no filename: {card}")
+            continue
+        single_card_list = load_single_card(filename, field_map)
+        all_pps.extend(single_card_list)
+
+    pp_all_df = pd.DataFrame(all_pps)
+    return pp_all_df, field_map
+
+def load_all_result(results_dir, track_pattern=""):
+    """
+    Scans a directory for CSV files matching the given track pattern, 
+    reads each into a list of dictionaries, and returns a tuple 
+    of (records, columns).
+
+    Args:
+        results_dir (str or Path): The root directory containing your result files.
+        track_pattern (str, optional): A pattern prefix for filenames 
+                                       (e.g., 'SA', 'AQU', etc.). Defaults to "".
+
+    Returns:
+        tuple: (all_results, columns)
+            - all_results (list[dict]): Each dict represents one row from any matching CSV file.
+            - columns (list[str]): A list of expected column names (placeholder, modify as needed).
+
+    Raises:
+        FileNotFoundError: If the directory does not exist.
+    """
+    results_path = Path(results_dir)
+    if not results_path.exists():
+        raise FileNotFoundError(f"Results directory '{results_path}' does not exist.")
+
+    # Adjust columns to your actual CSV structure
+    columns = ["track", "date", "race_no", "entry", "finish", "other_cols"]
+
+    all_results = []
+
+    logger.info(f"Searching for CSV files in '{results_path}' with pattern '{track_pattern}'")
+
+    for csv_file in results_path.rglob(track_pattern):
+        if csv_file.is_file():
+            logger.debug(f"Reading file: {csv_file}")
+            try:
+                df = pd.read_csv(csv_file)
+                # Convert each row to a dict and append to all_results
+                for _, row in df.iterrows():
+                    record = row.to_dict()
+                    all_results.append(record)
+            except Exception as e:
+                logger.error(f"Error reading {csv_file}: {e}")
+        else:
+            logger.debug(f"Skipping non-file path: {csv_file}")
+
+    logger.info(f"Total records loaded: {len(all_results)} from pattern '{track_pattern}'")
+
+    return all_results, columns
+
+
+
+===== File: data_prep\utilities.py =====
+# FastRaceML/data_prep/utilities.py
+
+"""
+General utility functions for logging setup, file manipulation, 
+and other reusables.
+"""
+
+import os
+import logging
+import configparser
+
+def setup_logging(log_file=None, level=logging.INFO):
+    """
+    Configures Python logging for the entire application.
+    If log_file is specified, logs will be written there, otherwise to console.
+    """
+    log_format = "[%(levelname)s] %(asctime)s - %(name)s - %(message)s"
+    if log_file:
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        logging.basicConfig(filename=log_file, level=level, format=log_format)
+    else:
+        logging.basicConfig(level=level, format=log_format)
+
+    logging.info("Logging configured.")
+
+def load_config():
+    """
+    Loads and returns configuration from 'config.ini', 
+    which should be located in the same directory as this file.
+    """
+    config = configparser.ConfigParser()
+    config_file_path = "config\config.ini"
+
+    if not os.path.exists(config_file_path):
+        raise FileNotFoundError(f"Config file not found at {config_file_path}")
+
+    config.read(config_file_path)
+    return config
+
+
+
+===== File: data_prep\__init__.py =====
+
+
+===== File: features\feature_calculator.py =====
+# FastRaceML/features/feature_calculator.py
+
+"""
+Implements various domain-specific feature calculations for horse racing.
+"""
+
+import pandas as pd
+
+class FeatureCalculator:
+    @staticmethod
+    def calculate_best_lifetime_speed(data: pd.Series):
+        """
+        Example: read 'best_bris_speed_life' from the row,
+        return 0 if missing or NaN.
+        """
+        speed = data.get('best_bris_speed_life', 0)
+        if pd.isna(speed):
+            return 0
+        return float(speed)
+
+    @staticmethod
+    def calculate_speed_last_race(data: pd.Series):
+        speed = data.get('speed_rating_856', 0)
+        if pd.isna(speed):
+            return 0
+        return float(speed)
+
+    # Add more static methods for each feature...
+
+
+
+===== File: features\feature_engineering.py =====
+#!/usr/bin/env python
+"""
+feature_engineering.py
+
+This module defines functions to perform feature engineering on a merged DataFrame.
+It selects only those columns whose corresponding entry in either the result field mapping 
+or the past performance (PP) field mapping has predictive_feature equal to "1".
+It also provides a simple imputation step to handle missing values.
+"""
+
+import pandas as pd
+import numpy as np
+import logging
+
+logger = logging.getLogger(__name__)
+
+def impute_missing_values(df):
+    """
+    Imputes missing values in the DataFrame.
+    
+    - For numeric columns, fills missing values with the median.
+    - For non-numeric (categorical) columns, fills missing values with the string "Missing".
+    
+    Args:
+        df (pd.DataFrame): DataFrame with missing values.
+    
+    Returns:
+        pd.DataFrame: DataFrame with missing values imputed.
+    """
+    df_imputed = df.copy()
+    
+    # Identify numeric and non-numeric columns.
+    numeric_cols = df_imputed.select_dtypes(include=[np.number]).columns
+    categorical_cols = df_imputed.select_dtypes(exclude=[np.number]).columns
+    
+    # Impute numeric columns with median.
+    for col in numeric_cols:
+        median_value = df_imputed[col].median()
+        df_imputed[col].fillna(median_value, inplace=True)
+        #logger.error(f"Imputed missing values in numeric column '{col}' with median: {median_value}")
+    
+    # Impute non-numeric columns with a placeholder string.
+    for col in categorical_cols:
+        df_imputed[col].fillna("Missing", inplace=True)
+        #logger.info(f"Imputed missing values in categorical column '{col}' with 'Missing'")
+    
+    return df_imputed
+
+def engineer_features(merged_df, result_field_map, pp_field_map):
+    """
+    Returns a feature-engineered DataFrame that includes only those columns from the merged DataFrame
+    for which the corresponding entry in either the result field mapping or the PP field mapping 
+    has predictive_feature equal to "1". Missing values are imputed instead of dropped.
+    
+    Args:
+        merged_df (pd.DataFrame): The merged DataFrame containing PP and result fields.
+        result_field_map (list of dict): Mapping for result fields.
+        pp_field_map (list of dict): Mapping for past performance fields.
+    
+    Returns:
+        pd.DataFrame: A new DataFrame containing only the combined predictive features with missing values imputed.
+    """
+    # Extract predictive fields from the result mapping.
+    predictive_fields_result = [
+        entry["field_name"] for entry in result_field_map
+        if str(entry.get("predictive_feature", "")).strip() == "1"
+    ]
+    logger.info(f"Predictive fields from result mapping: {predictive_fields_result}")
+    
+    # Extract predictive fields from the PP mapping.
+    predictive_fields_pp = [
+        entry["field_name"] for entry in pp_field_map
+        if str(entry.get("predictive_feature", "")).strip() == "1"
+    ]
+    #logger.info(f"Predictive fields from PP mapping: {predictive_fields_pp}")
+    
+    # Combine predictive fields from both mappings (remove duplicates).
+    combined_predictive_fields = list(set(predictive_fields_result + predictive_fields_pp))
+    logger.info(f"Combined predictive fields: {combined_predictive_fields}")
+    
+    # Select columns from merged_df that match the combined predictive fields.
+    feature_columns = [col for col in merged_df.columns if col in combined_predictive_fields]
+    #logger.info(f"Feature columns found in merged DataFrame: {feature_columns}")
+    
+    if not feature_columns:
+        raise ValueError("No predictive feature columns found in the merged DataFrame.")
+    
+    # Create the engineered DataFrame from the selected columns.
+    engineered_df = merged_df[feature_columns].copy()
+    
+    # Impute missing values instead of dropping them.
+    engineered_df = impute_missing_values(engineered_df)
+    logger.info(f"Engineered DataFrame shape after imputation: {engineered_df.shape}")
+    
+    # Save the engineered DataFrame to CSV.
+    engineered_df.to_csv("data\\outputs\\engineered_features.csv", index=False)
+    logger.info("Engineered features saved to 'engineered_features.csv'.")
+
+    return engineered_df
+
+# Example usage for testing:
+if __name__ == "__main__":
+    import sys
+    logging.basicConfig(stream=sys.stdout, level=logging.INFO, format='[%(levelname)s] %(message)s')
+    
+    # Create a dummy merged DataFrame.
+    merged_data = {
+        "res_track_name": ["SA", "SA", "SA", "SA"],
+        "res_race_date": ["2025-01-01", "2025-01-02", "2025-01-03", "2025-01-04"],
+        "res_race_number": [1, 2, 3, 4],
+        "res_finish_position": [2, 1, 3, np.nan],  # One missing value
+        "track": ["SA", "SA", "SA", "SA"],
+        "date": ["2025-01-01", "2025-01-02", "2025-01-03", "2025-01-04"],
+        "race_no": [1, 2, 3, 4],
+        "entry": ["Horse A", "Horse B", "Horse C", "Horse D"]
+    }
+    merged_df = pd.DataFrame(merged_data)
+    
+    # Create dummy field mappings.
+    result_field_map = [
+        {"field_name": "res_track_name", "predictive_feature": "1"},
+        {"field_name": "res_race_date", "predictive_feature": "1"},
+        {"field_name": "res_race_number", "predictive_feature": "1"},
+        {"field_name": "res_finish_position", "predictive_feature": "1"},
+        {"field_name": "res_horse_name", "predictive_feature": "0"}
+    ]
+    pp_field_map = [
+        {"field_name": "track", "predictive_feature": "1"},
+        {"field_name": "date", "predictive_feature": "1"},
+        {"field_name": "race_no", "predictive_feature": "1"},
+        {"field_name": "entry", "predictive_feature": "0"}
+    ]
+    
+    engineered_df = engineer_features(merged_df, result_field_map, pp_field_map)
+    print("Engineered features DataFrame:")
+    print(engineered_df)
+
+
+
+===== File: features\feature_set.py =====
+# FastRaceML/features/feature_set.py
+
+"""
+Classes for storing and organizing feature values.
+"""
+
+class HorseRaceFeature:
+    """
+    Simple container for a single feature name and value.
+    """
+    def __init__(self, feature_name):
+        self.feature_name = feature_name
+        self.value = None
+
+    def set_value(self, val):
+        self.value = val
+
+    def get_value(self):
+        return self.value
+
+class HorseRaceFeatureSet:
+    """
+    Manages a collection of HorseRaceFeature objects.
+    """
+    def __init__(self):
+        self.features = {}
+
+    def add_feature(self, feature_name):
+        if feature_name in self.features:
+            raise ValueError(f"Feature '{feature_name}' already exists.")
+        self.features[feature_name] = HorseRaceFeature(feature_name)
+
+    def set_feature_value(self, feature_name, val):
+        if feature_name not in self.features:
+            raise ValueError(f"Feature '{feature_name}' not found.")
+        self.features[feature_name].set_value(val)
+
+    def get_feature_value(self, feature_name):
+        if feature_name not in self.features:
+            raise ValueError(f"Feature '{feature_name}' not found.")
+        return self.features[feature_name].get_value()
+
+    def get_all_features(self):
+        return {name: f.get_value() for name, f in self.features.items()}
+
+
+
+===== File: features\__init__.py =====
+
+
+===== File: main\pipeline.py =====
+import logging
+import pandas as pd
+import numpy as np
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import train_test_split
+
+# Imports from your project modules:
+from data_prep.ingestion import scan_cards, load_results_and_merge
+from data_prep.readers import load_all_pp_cards
+from data_prep.utilities import load_config, setup_logging
+from features.feature_engineering import engineer_features
+
+logger = logging.getLogger(__name__)
+
+# Define identifier columns that should be preserved (not preprocessed).
+ID_COLUMNS = ["race_key", "track", "date", "race_no"]
+
+def configure_pipeline():
+    """
+    Configure logging and load configuration from config.ini.
+    Returns the config object.
+    """
+    setup_logging(level=logging.INFO)
+    logger.info("Logging configured.")
+    config = load_config()
+    return config
+
+def get_paths_and_patterns(config):
+    """
+    Read track code, directory paths, and mapping file paths from config.
+    Build file patterns based on the track code.
+    
+    Returns:
+        (track, pp_location, result_location, predict_location, 
+         pp_field_mapping_csv, result_field_mapping_csv,
+         pp_track_pattern, res_track_pattern)
+    """
+    track = config["DEFAULT"].get("track", "SA")
+    logger.error(f"Track from config.ini: {track}")
+    
+    pp_location = config["DEFAULT"].get("pp_location")             # e.g., .../data/raw
+    result_location = config["DEFAULT"].get("result_location")       # e.g., .../data/raw/results
+    predict_location = config["DEFAULT"].get("predict_location")     # e.g., .../data/raw/predict
+    
+    pp_field_mapping_csv = config["DEFAULT"].get("pp_fields_mapping_location")
+    result_field_mapping_csv = config["DEFAULT"].get("result_fields_mapping_location")
+    
+    pp_track_pattern = f"{track}*.DRF"
+    res_track_pattern = f"{track}*.*"
+    
+    return (track, pp_location, result_location, predict_location,
+            pp_field_mapping_csv, result_field_mapping_csv,
+            pp_track_pattern, res_track_pattern)
+
+def preprocess_data(X, num_strategy='mean', cat_strategy='most_frequent'):
+    """
+    Preprocess the feature DataFrame by imputing missing values separately for numeric
+    and non-numeric (categorical) columns.
+    
+    - Numeric columns are imputed using the given strategy and then converted to float.
+    - Categorical columns are imputed using the given strategy and then converted to integer codes.
+    
+    Returns a DataFrame with the original column names.
+    """
+    X_processed = X.copy()
+    
+    # Convert boolean columns to integers.
+    bool_cols = X_processed.select_dtypes(include=['bool']).columns
+    if len(bool_cols) > 0:
+        logger.error(f"Converting boolean columns to integers: {list(bool_cols)}")
+        X_processed[bool_cols] = X_processed[bool_cols].astype(int)
+    
+    # Identify numeric and categorical columns.
+    numeric_cols = X_processed.select_dtypes(include=["number"]).columns.tolist()
+    categorical_cols = X_processed.select_dtypes(exclude=["number"]).columns.tolist()
+    
+    # Impute numeric columns.
+    if numeric_cols:
+        num_imputer = SimpleImputer(strategy=num_strategy)
+        X_num = pd.DataFrame(num_imputer.fit_transform(X_processed[numeric_cols]),
+                             columns=numeric_cols, index=X_processed.index)
+        X_num = X_num.astype(float)
+    else:
+        X_num = pd.DataFrame(index=X_processed.index)
+    
+    # Impute categorical columns.
+    if categorical_cols:
+        cat_imputer = SimpleImputer(strategy=cat_strategy)
+        X_cat = pd.DataFrame(cat_imputer.fit_transform(X_processed[categorical_cols]),
+                             columns=categorical_cols, index=X_processed.index)
+        # Convert categorical columns to integer codes.
+        for col in X_cat.columns:
+            X_cat[col] = pd.Categorical(X_cat[col]).codes
+    else:
+        X_cat = pd.DataFrame(index=X_processed.index)
+    
+    X_processed = pd.concat([X_num, X_cat], axis=1)
+    logger.error(f"Preprocessed data shape: {X_processed.shape}")
+    return X_processed
+
+def prepare_data_for_modeling_multitarget(df, target_columns):
+    """
+    Splits the DataFrame into training, validation, and test sets for multi-target regression.
+    
+    Args:
+         df (pd.DataFrame): Input DataFrame.
+         target_columns (list): List of target column names.
+    
+    Returns:
+         X_train, X_val, X_test, y_train, y_val, y_test
+    """
+    X = df.drop(columns=target_columns)
+    y = df[target_columns]
+    X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.4, random_state=42)
+    X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+    return X_train, X_val, X_test, y_train, y_val, y_test
+
+def prepare_model_data(merged_df, field_map, target_columns=["res_final_time", "res_finish_position", "res_beaten_lengths", "res_odds"]):
+    """
+    Prepares the merged data for modeling by splitting into train, validation, and test sets.
+    Raises an error if any target column is not found.
+    
+    Args:
+        merged_df (pd.DataFrame): Merged training data.
+        field_map: Field mapping used for splitting.
+        target_columns (list): List of target column names.
+    
+    Returns:
+        X_train, X_val, X_test, y_train, y_val, y_test
+    """
+    missing_targets = [col for col in target_columns if col not in merged_df.columns]
+    if missing_targets:
+        raise ValueError(f"Target columns {missing_targets} not in DataFrame. Available columns: {merged_df.columns.tolist()}")
+    
+    X_train, X_val, X_test, y_train, y_val, y_test = prepare_data_for_modeling_multitarget(merged_df, target_columns)
+    logger.error(f"Data ready. Train: {X_train.shape}, Val: {X_val.shape}, Test: {X_test.shape}")
+    return X_train, X_val, X_test, y_train, y_val, y_test
+
+def training_phase_old(pp_location, result_location, pp_field_mapping_csv, result_field_mapping_csv, pp_track_pattern, res_track_pattern):
+    """
+    Training Phase:
+    - Loads PP and result data.
+    - Merges data and cleans target columns.
+    - Drops identifier columns from features before training.
+    - Splits data, preprocesses features, and trains a multi-target model.
+    
+    Returns:
+        model: Trained model.
+        merged_df: Merged DataFrame used for training.
+        target_columns: List of target column names.
+        training_columns: List of feature column names used for training.
+        pp_field_map: The PP field mapping.
+    """
+    # Define multi-target columns.
+    target_columns = ["res_final_time", "res_finish_position", "res_beaten_lengths", "res_odds"]
+    
+    # Load PP data.
+    pp_cards = scan_cards(pp_location, pp_track_pattern)
+    pp_all_df, pp_field_map = load_all_pp_cards(pp_cards, pp_field_mapping_csv)
+    logger.error(f"Loaded PP data: {pp_all_df.shape}")
+    
+    # Load result data and merge with PP data.
+    merged_df, _ = load_results_and_merge(pp_all_df, result_location, result_field_mapping_csv, res_track_pattern)
+    #logger.error(f"Merged data shape: {merged_df.shape}")
+    #logger.error(f"Merged columns: {merged_df.columns.tolist()}")
+    
+    # Clean target columns: drop rows with missing any target and convert to numeric.
+    merged_df = merged_df.dropna(subset=target_columns)
+    for col in target_columns:
+        merged_df[col] = pd.to_numeric(merged_df[col], errors='coerce')
+    #logger.error(f"After cleaning, merged data shape: {merged_df.shape}")
+    
+    # Prepare data for modeling using the PP field mapping.
+    X_train, X_val, X_test, y_train, y_val, y_test = prepare_model_data(merged_df, pp_field_map, target_columns)
+    
+    # Drop identifier columns from features.
+    X_train = X_train.drop(columns=ID_COLUMNS, errors='ignore')
+    X_val = X_val.drop(columns=ID_COLUMNS, errors='ignore')
+    X_test = X_test.drop(columns=ID_COLUMNS, errors='ignore')
+    
+    # Preprocess feature data.
+    X_train = pd.DataFrame(preprocess_data(X_train), columns=X_train.columns, index=X_train.index)
+    X_val = pd.DataFrame(preprocess_data(X_val), columns=X_val.columns, index=X_val.index)
+    X_test = pd.DataFrame(preprocess_data(X_test), columns=X_test.columns, index=X_test.index)
+    #logger.error(f"Training feature shapes: X_train {X_train.shape}, X_val {X_val.shape}, X_test {X_test.shape}")
+    
+    # Capture training feature columns.
+    training_columns = X_train.columns.tolist()
+    
+    # Train a multi-target model (using Linear Regression as an example).
+    from sklearn.linear_model import LinearRegression
+    model = LinearRegression()
+    model.fit(X_train, y_train)
+    logger.error("Model training completed.")
+    
+    return model, merged_df, target_columns, training_columns, pp_field_map
+
+def training_phase(pp_location, result_location, pp_field_mapping_csv, result_field_mapping_csv, pp_track_pattern, res_track_pattern):
+    """
+    Training Phase:
+    - Loads PP and result data.
+    - Merges data and cleans target columns.
+    - Drops identifier columns from features before training.
+    - Splits data, preprocesses features, scales targets, and trains a multi-target model.
+    
+    Returns:
+        model: Trained model.
+        merged_df: Merged DataFrame used for training.
+        target_columns: List of target column names.
+        training_columns: List of feature column names used for training.
+        pp_field_map: The PP field mapping.
+        target_scaler: Scaler used to transform the target values.
+    """
+    # Define multi-target columns.
+    # Ensure the order here matches your expected output ordering.
+    target_columns = ["res_final_time", "res_finish_position", "res_beaten_lengths", "res_odds"]
+
+    # Load PP data.
+    pp_cards = scan_cards(pp_location, pp_track_pattern)
+    pp_all_df, pp_field_map = load_all_pp_cards(pp_cards, pp_field_mapping_csv)
+    logger.error(f"Loaded PP data: {pp_all_df.shape}")
+
+    # Load result data and merge with PP data.
+    merged_df, _ = load_results_and_merge(pp_all_df, result_location, result_field_mapping_csv, res_track_pattern)
+
+    # Remove duplicate columns that may have resulted from merging.
+    merged_df = merged_df.loc[:, ~merged_df.columns.duplicated()]
+
+    # Clean target columns: drop rows with missing any target and convert values to numeric.
+    merged_df = merged_df.dropna(subset=target_columns)
+    for col in target_columns:
+        merged_df[col] = pd.to_numeric(merged_df[col], errors='coerce')
+
+    # Prepare data for modeling using the PP field mapping.
+    X_train, X_val, X_test, y_train, y_val, y_test = prepare_model_data(merged_df, pp_field_map, target_columns)
+
+    # Drop identifier columns from features.
+    X_train = X_train.drop(columns=ID_COLUMNS, errors='ignore')
+    X_val = X_val.drop(columns=ID_COLUMNS, errors='ignore')
+    X_test = X_test.drop(columns=ID_COLUMNS, errors='ignore')
+
+    # Preprocess feature data.
+    X_train = pd.DataFrame(preprocess_data(X_train), columns=X_train.columns, index=X_train.index)
+    X_val = pd.DataFrame(preprocess_data(X_val), columns=X_val.columns, index=X_val.index)
+    X_test = pd.DataFrame(preprocess_data(X_test), columns=X_test.columns, index=X_test.index)
+
+    # Capture training feature columns.
+    training_columns = X_train.columns.tolist()
+
+    # Scale target values to normalize them and ensure proper ranges.
+    from sklearn.preprocessing import StandardScaler
+    target_scaler = StandardScaler()
+    y_train_scaled = target_scaler.fit_transform(y_train)
+    y_val_scaled = target_scaler.transform(y_val)
+    y_test_scaled = target_scaler.transform(y_test)
+
+    # Train a multi-target model (using Linear Regression as an example) on the scaled targets.
+    from sklearn.linear_model import LinearRegression
+    model = LinearRegression()
+    model.fit(X_train, y_train_scaled)
+    logger.error("Model training completed.")
+
+    # Note: During prediction, remember to:
+    #   1. Apply model.predict(X_test) to get scaled predictions.
+    #   2. Use target_scaler.inverse_transform(predictions_scaled) to convert back to original scale.
+    #   3. Post-process outputs (e.g., round finish positions, clip negative beaten lengths, ensure odds are between 0 and 1).
+
+    return model, merged_df, target_columns, training_columns, pp_field_map, target_scaler
+
+def prediction_phase(predict_location, pp_field_mapping_csv, pp_track_pattern, model, training_columns, target_columns):
+    """
+    Step 4: Prediction Phase.
+    - Loads new PP data from the prediction directory.
+    - Adds dummy target columns (for target_columns) if missing.
+    - Drops identifier columns before feature engineering.
+    - Applies feature engineering using the PP field mapping.
+    - Preprocesses and aligns features to match the training feature columns.
+    - Uses the trained model to predict multi-target outcomes.
+    - Appends the predictions as new columns.
+    - Post-processes the predicted finishing position into ranks.
+    - Merges the predicted columns back with the original raw data.
+    - Writes out the final CSV containing only the desired columns.
+    
+    Returns:
+        predictions: Predicted values (an array of shape (n_samples, n_targets)).
+        final_df: DataFrame with the original prediction data and appended predicted target columns.
+    """
+    # Load PP data from the prediction directory.
+    predict_cards = scan_cards(predict_location, pp_track_pattern)
+    predict_pp_df, predict_pp_field_map = load_all_pp_cards(predict_cards, pp_field_mapping_csv)
+    logger.error(f"Loaded prediction PP data: {predict_pp_df.shape}")
+    
+    # Add dummy target columns if not present.
+    for col in target_columns:
+        if col not in predict_pp_df.columns:
+            predict_pp_df[col] = np.nan
+    #logger.error(f"Prediction PP data columns: {predict_pp_df.columns.tolist()}")
+    
+    # Preserve the original prediction data for final output.
+    original_df = predict_pp_df.copy()
+    
+    # Drop identifier columns from data used for feature engineering.
+    X_pred_raw = predict_pp_df.drop(columns=ID_COLUMNS, errors='ignore')
+    
+    # Apply feature engineering using the PP field mapping.
+    engineered_predict_df = engineer_features(X_pred_raw, [], predict_pp_field_map)
+    logger.error(f"Engineered prediction features shape (before alignment): {engineered_predict_df.shape}")
+    
+    # If no predictive columns were produced, create default features using training_columns.
+    if engineered_predict_df.shape[1] == 0:
+        logger.warning("No predictive feature columns produced; creating default features using training_columns.")
+        engineered_predict_df = pd.DataFrame(0, index=X_pred_raw.index, columns=training_columns)
+    else:
+        # Preprocess engineered features.
+        engineered_predict_df = pd.DataFrame(preprocess_data(engineered_predict_df),
+                                              columns=engineered_predict_df.columns,
+                                              index=engineered_predict_df.index)
+    
+    # Align engineered features with the training feature columns.
+    engineered_predict_df = engineered_predict_df.reindex(columns=training_columns, fill_value=0)
+    logger.error(f"Engineered prediction features shape (after alignment): {engineered_predict_df.shape}")
+    
+    # Predict multi-target outcomes using the trained model.
+    predictions = model.predict(engineered_predict_df)  # predictions shape: (n_samples, n_targets)
+    logger.error("Prediction completed.")
+    
+    # Append predictions as new columns: one per target.
+    for idx, target in enumerate(target_columns):
+        col_name = "predicted_" + target
+        engineered_predict_df[col_name] = predictions[:, idx]
+    
+    # Post-process the predicted finishing position.
+    predicted_fp_col = "predicted_res_finish_position"
+    if predicted_fp_col in engineered_predict_df.columns:
+        # Compute the rank: lower values get lower rank numbers (rank 1 is best).
+        ranked_fp = engineered_predict_df[predicted_fp_col].rank(method="min").astype(int)
+        engineered_predict_df[predicted_fp_col] = ranked_fp
+        logger.error(f"Post-processed {predicted_fp_col} to integer rankings.")
+    
+    # Define the list of desired output columns.
+    output_columns = [
+        "track",
+        "date",
+        "race_no",
+        "post_position",
+        "entry",
+        "distance_in_yards",
+        "race_type",
+        "todays_trainer",
+        "todays_jockey",
+        "horse_name",
+        "predicted_res_final_time",
+        "predicted_res_finish_position",
+        "predicted_res_beaten_lengths",
+        "predicted_res_odds"
+    ]
+    
+    # Merge the engineered prediction columns with the original prediction data.
+    final_df = pd.concat([original_df.reset_index(drop=True), engineered_predict_df.reset_index(drop=True)], axis=1)
+    
+    # Filter to only the desired output columns.
+    final_df = final_df[output_columns]
+    
+    # Write out the final DataFrame to CSV.
+    output_file = "predicted_results.csv"
+    final_df.to_csv(output_file, index=False)
+    logger.error(f"Predicted results saved to '{output_file}'.")
+    
+    return predictions, final_df
+
+def main():
+    # Configure and load configuration.
+    config = configure_pipeline()
+    
+    # Get track and paths.
+    (track, pp_location, result_location, predict_location,
+     pp_field_mapping_csv, result_field_mapping_csv,
+     pp_track_pattern, res_track_pattern) = get_paths_and_patterns(config)
+    
+    # Training Phase.
+    model, merged_df, target_columns, training_columns, pp_field_map, target_scaler = training_phase(
+        pp_location, result_location, pp_field_mapping_csv, result_field_mapping_csv, pp_track_pattern, res_track_pattern
+    )
+
+    # Prediction Phase.
+    predictions, finl_df = prediction_phase(
+        predict_location, pp_field_mapping_csv, pp_track_pattern, model, training_columns, target_columns
+    )
+    
+    # Print summary information.
+    print("Merged training data shape:", merged_df.shape)
+    #print("Final prediction data shape:", final_df.shape)
+    #print("Predictions for new races:")
+    print(predictions)
+
+if __name__ == "__main__":
+    main()
+
+
+
+===== File: main\__init__.py =====
+
+
+===== File: modeling\model_training.py =====
+# FastRaceML/modeling/model_training.py
+
+"""
+Machine learning training utilities, e.g., logistic regression, 
+model evaluation, etc.
+"""
+
+import logging
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+from sklearn.calibration import label_binarize
+from sklearn.metrics import confusion_matrix, roc_auc_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.model_selection import cross_val_score
+
+logger = logging.getLogger(__name__)
+
+def remap_labels(y):
+    """
+    Modified remap_labels function that checks if y contains numeric data (or is multi-dimensional).
+    For multi-target regression (or numeric targets), return y as a NumPy array without mapping.
+    For classification, you can provide a mapping as needed.
+    """
+    # If y is a DataFrame or 2D array and its dtypes are numeric, do nothing.
+    y_array = np.array(y)
+    if np.issubdtype(y_array.dtype, np.number) or y_array.ndim > 1:
+        # For regression, simply return the array and an empty mapping.
+        return y_array, {}
+    else:
+        # For classification, you can implement your mapping logic here.
+        mapping = {}  # your mapping dictionary
+        y_mapped = np.array([mapping[label] for label in y])
+        return y_mapped, mapping
+
+def lgb_classifier(X_train, y_train, X_val, y_val, X_test, y_test):
+    # Prepare datasets for LightGBM
+    train_data = lgb.Dataset(X_train, label=y_train)
+    val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
+    
+    # Define model parameters for multiclass classification
+    num_class = len(np.unique(y_train))
+    params = {
+        'objective': 'multiclass',
+        'num_class': num_class,
+        'learning_rate': 0.05,
+        'num_leaves': 31,
+        'verbose': -1,
+        'random_state': 42,
+        'metric': 'multi_logloss'  # Use a supported multiclass metric
+    }
+    
+    # Train the model
+    model = lgb.train(
+        params, 
+        train_data, 
+        valid_sets=[val_data],
+        num_boost_round=1000
+    )
+    
+    # Extract feature importances (optional)
+    feature_importance = model.feature_importance(importance_type='gain')
+    
+    # Predict probabilities for each class
+    test_preds = model.predict(X_test)
+    
+    # Binarize y_test so that it has one column for each class
+    n_classes = test_preds.shape[1]
+    y_test_bin = label_binarize(y_test, classes=list(range(n_classes)))
+    
+    # Compute ROC AUC externally using One-vs-Rest strategy
+    test_auc = roc_auc_score(y_test_bin, test_preds, multi_class='ovr')
+    logger.info(f'Test AUC: {test_auc:.4f}')
+    
+    y_pred_class = np.argmax(test_preds, axis=1)
+
+    accuracy = accuracy_score(y_test, y_pred_class)
+    logger.info(f"Accuracy: {accuracy:.4f}")
+
+    cm = confusion_matrix(y_test, y_pred_class)
+    logger.info(f"Confusion Matrix:\n{cm}")
+
+    logger.info("Classification Report:\n" + classification_report(y_test, y_pred_class))
+
+    # Ensure y_test is binarized (if not already)
+    n_classes = test_preds.shape[1]
+    y_test_bin = label_binarize(y_test, classes=list(range(n_classes)))
+
+    roc_auc = roc_auc_score(y_test_bin, test_preds, multi_class='ovr')
+    logger.info(f"Multiclass ROC AUC (OvR): {roc_auc:.4f}")
+
+    # Make sure to use a classifier that works directly with your data.
+    clf = RandomForestClassifier(n_estimators=100, random_state=42)
+    # You might need to modify this if you're using a custom training pipeline.
+
+    # cross_val_score returns scores for each fold
+    scores = cross_val_score(clf, X_train, y_train, cv=5, scoring='accuracy')
+    logger.info(f"Cross-Validation Accuracy Scores: {scores}")
+    logger.info(f"Mean CV Accuracy: {scores.mean()}")
+
+    return model, feature_importance
+
+def random_forest_classifier(X_train, y_train, X_val, y_val, X_test, y_test):
+    # Instantiate the model; 'class_weight' helps if classes are imbalanced.
+    model = RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced')
+    
+    # Train the model
+    model.fit(X_train, y_train)
+    
+    # Extract feature importances
+    feature_importance = model.feature_importances_
+    
+    # Optionally evaluate performance on validation and test sets
+    val_preds = model.predict_proba(X_val)[:, 1]
+    test_preds = model.predict_proba(X_test)[:, 1]
+    val_auc = roc_auc_score(y_val, val_preds)
+    test_auc = roc_auc_score(y_test, test_preds)
+    logger.info(f'Validation AUC: {val_auc:.4f}')
+    logger.info(f'Test AUC: {test_auc:.4f}')
+    
+    return model, feature_importance
+
+def binary_regression_classifier(X_train, y_train, X_val, y_val, X_test, y_test):
+    """
+    Train, validate, and test a logistic regression model.
+    Returns:
+        model (LogisticRegression)
+        feature_importance (pd.DataFrame)
+    """
+
+    print("Any NaNs in X_train?", np.isnan(X_train).any())
+    print("Any NaNs in y_train?", np.isnan(y_train).any())
+
+
+    model = LogisticRegression(random_state=42, max_iter=500)
+    model.fit(X_train, y_train)
+
+    # Validation
+    y_val_pred = model.predict(X_val)
+    val_acc = accuracy_score(y_val, y_val_pred)
+    logger.info(f"Validation Accuracy: {val_acc:.2f}")
+
+    # Test
+    y_test_pred = model.predict(X_test)
+    test_acc = accuracy_score(y_test, y_test_pred)
+    logger.info(f"Test Accuracy: {test_acc:.2f}")
+
+    # Classification report
+    logger.info("Classification Report (Test):\n" + classification_report(y_test, y_test_pred))
+
+    # Feature importance
+    coefs = pd.DataFrame({
+        "Feature": X_train.columns,
+        "Coefficient": model.coef_[0]
+    }).sort_values(by="Coefficient", ascending=False)
+    logger.info(f"Top 10 features:\n{coefs.head(10)}")
+
+    return model, coefs
+
+
+
+===== File: modeling\__init__.py =====
+
+

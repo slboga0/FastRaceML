@@ -1,13 +1,4 @@
-# FastRaceML/features/feature_set.py
-
-"""
-Classes for storing and organizing feature values.
-"""
-
 class HorseRaceFeature:
-    """
-    Simple container for a single feature name and value.
-    """
     def __init__(self, feature_name):
         self.feature_name = feature_name
         self.value = None
@@ -19,9 +10,6 @@ class HorseRaceFeature:
         return self.value
 
 class HorseRaceFeatureSet:
-    """
-    Manages a collection of HorseRaceFeature objects.
-    """
     def __init__(self):
         self.features = {}
 
@@ -41,4 +29,4 @@ class HorseRaceFeatureSet:
         return self.features[feature_name].get_value()
 
     def get_all_features(self):
-        return {name: f.get_value() for name, f in self.features.items()}
+        return {name: feature.get_value() for name, feature in self.features.items()}

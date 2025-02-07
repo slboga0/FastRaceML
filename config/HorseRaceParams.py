@@ -1,18 +1,16 @@
-# FastRaceML/HorseRaceParams.py
-
 import os
 from data_prep.utilities import setup_logging
 
-# Example param definitions
-current_dir = os.getcwd()
-data_dir = os.path.join(current_dir, "Data")
-log_dir = os.path.join(current_dir, "Log")
-output_dir = os.path.join(data_dir, "predictions")
-temp_dir = os.path.join(current_dir, "Temp")
+# Define directories and constants.
+CURRENT_DIR = os.getcwd()
+DATA_DIR = os.path.join(CURRENT_DIR, "data")
+LOG_DIR = os.path.join(CURRENT_DIR, "logs")
+OUTPUT_DIR = os.path.join(DATA_DIR, "predictions")
+TEMP_DIR = os.path.join(CURRENT_DIR, "temp")
 
-# Possibly call setup_logging, or let pipeline handle that
-# setup_logging(os.path.join(log_dir, "FastRaceML.log"))
+# Optionally, initialize logging here.
+# setup_logging(os.path.join(LOG_DIR, "FastRaceML.log"))
 
-# Additional constants or paths
-max_npp = 10
-max_nwrk = 12
+# Additional constants.
+MAX_NPP = 10
+MAX_NWRK = 12
